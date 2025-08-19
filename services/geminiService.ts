@@ -1,8 +1,9 @@
+
 import { GoogleGenAI, Type, Chat } from "@google/genai";
 import { User, WellnessService, Recommendation } from '../types';
 import { WELLNESS_SERVICES } from '../constants';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 let chat: Chat | null = null;
 
 const responseSchema = {
@@ -33,27 +34,30 @@ const responseSchema = {
 
 export const initWellnessChat = (user: User) => {
     const personality = user.membershipTier === 'premium'
-        ? `Eres Caliope, una Coach de Bienestar experta, proactiva y perspicaz. Tu objetivo es ser una guía a largo plazo para el usuario. Eres alentadora pero también analítica. Utiliza su historial y metas para hacer preguntas de seguimiento inteligentes y ofrecer recomendaciones que no solo respondan a su estado actual, sino que también lo ayuden a avanzar hacia sus objetivos a largo plazo.`
-        : `Eres Caliope, una experta curadora de bienestar amigable y empática. Tu tarea es conversar con el usuario para entender sus necesidades y recomendar los servicios de bienestar más adecuados de una lista que te proporcionaré. Tu tono debe ser siempre alentador, conversacional y comprensivo.`;
+        ? `Eres Caliope, una Coach de Bienestar experta, proactiva y perspicaz. Tu objetivo es analizar al usuario para ser su guía a largo plazo. Sé analítica. Utiliza su historial y metas para seleccionar recomendaciones que no solo respondan a su estado actual, sino que también lo ayuden a avanzar hacia sus objetivos a largo plazo.`
+        : `Eres Caliope, una experta curadora de bienestar amigable y empática. Tu tarea es analizar las necesidades del usuario para recomendar los servicios de bienestar más adecuados de una lista que te proporcionaré. Basa tu selección en un análisis empático y comprensivo de su mensaje.`;
 
     const systemInstruction = `
         ${personality}
 
-        Reglas estrictas:
-        1. Analiza las preferencias, metas e información del usuario para personalizar tus respuestas.
-        2. Cuando el usuario pida recomendaciones, debes responder con texto conversacional y, al final de tu mensaje, incluir un bloque de código JSON que contenga tus recomendaciones.
-        3. El bloque de código JSON DEBE estar envuelto en \`\`\`json ... \`\`\`.
-        4. El JSON debe adherirse estrictamente al esquema proporcionado. Solo puedes recomendar servicios de la lista.
-        5. Si el usuario hace una pregunta de seguimiento, utiliza el contexto de la conversación para responder.
-        6. No inventes servicios. Selecciona únicamente de la lista de servicios disponibles.
+        Reglas de Salida Estrictas:
+        1. Tu ÚNICA salida debe ser un objeto JSON válido que se ajuste al esquema proporcionado.
+        2. NO incluyas NINGÚN texto, explicación, o markdown (como \`\`\`json) fuera del objeto JSON. La respuesta debe ser JSON puro.
+        
+        Reglas de Lógica:
+        1. Analiza el mensaje del usuario en el contexto de sus datos (metas, biografía) para entender su necesidad principal.
+        2. Selecciona de 2 a 3 servicios de la lista proporcionada que mejor se ajusten a esa necesidad.
+        3. Para cada servicio seleccionado, escribe una razón breve y personalizada en el campo "reason", explicando por qué es una buena opción para el usuario en este momento.
+        4. Si no encuentras recomendaciones adecuadas, devuelve un objeto JSON con un array de recomendaciones vacío: \`{"recommendations": []}\`.
+        5. No inventes servicios. Selecciona únicamente de la lista de servicios disponibles.
 
-        Aquí están los datos del usuario:
+        Aquí están los datos del usuario para tu análisis:
         - Nombre: ${user.name}
         - Nivel de Membresía: ${user.membershipTier}
         - Metas de bienestar: ${user.goals || 'No especificado'}
         - Biografía/Intereses: ${user.bio || 'No especificado'}
 
-        Esta es la lista completa de servicios de bienestar disponibles:
+        Esta es la lista completa de servicios de bienestar disponibles para seleccionar:
         ${JSON.stringify(WELLNESS_SERVICES, null, 2)}
     `;
 
@@ -130,3 +134,74 @@ export const getDailyWellnessTip = async (): Promise<string> => {
         throw new Error("No se pudo generar el consejo del día.");
     }
 }
+
+export const analyzeJournalEntry = async (imageAsBase64: string, mimeType: string, userText: string): Promise<string> => {
+    try {
+        const imagePart = {
+            inlineData: {
+                mimeType: mimeType,
+                data: imageAsBase64,
+            },
+        };
+        const textPart = {
+            text: `Eres Caliope, una coach de bienestar empática. Analiza la imagen y los pensamientos del usuario. Proporciona una reflexión breve (2-3 frases), positiva y perspicaz. Céntrate en reconocer sus sentimientos y quizás sugerir una acción consciente simple. Tu tono debe ser amable y alentador. Pensamientos del usuario: "${userText}"`,
+        };
+        
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: { parts: [imagePart, textPart] },
+        });
+
+        const analysis = response.text.trim();
+        if (!analysis) {
+            throw new Error("No se pudo generar un análisis.");
+        }
+        return analysis;
+    } catch (error) {
+        console.error("Error al analizar la entrada del diario:", error);
+        throw new Error("No pude analizar tu momento. Por favor, inténtalo de nuevo.");
+    }
+};
+
+export const getProactiveSuggestion = async (user: User): Promise<string> => {
+    try {
+        const prompt = `
+            Eres Caliope, una coach de bienestar proactiva y perspicaz.
+            Basado en los datos del usuario, genera una sugerencia corta, amable y accionable para su día.
+            Tu sugerencia debe ser una sola frase motivadora.
+            Considera su meta principal, pero también puedes dar un consejo general si lo crees conveniente.
+            No sugieras un servicio específico de la lista, sino una acción o reflexión.
+
+            Datos del usuario:
+            - Nombre: ${user.name}
+            - Meta de bienestar: ${user.goals || 'No especificado'}
+            - Biografía/Intereses: ${user.bio || 'No especificado'}
+            - Últimas interacciones: ${user.history.length > 0 ? user.history[0].preferences : 'Ninguna reciente'}
+
+            Ejemplos de sugerencias:
+            - "Recuerda que tu meta es mejorar tu fitness. ¿Qué tal una caminata de 15 minutos hoy para activar tu cuerpo?"
+            - "Dado que buscas reducir el estrés, considera tomar 5 minutos para una respiración profunda cuando te sientas abrumado/a."
+            - "Un pequeño paso hoy es un gran salto para tu bienestar mañana. ¡Sigue así!"
+
+            Ahora, crea una nueva sugerencia personalizada para ${user.name}:
+        `;
+
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                temperature: 0.7,
+            }
+        });
+        const suggestion = response.text.trim();
+        if (!suggestion) {
+            throw new Error("No se pudo generar la sugerencia.");
+        }
+        return suggestion;
+
+    } catch (error) {
+        console.error("Error al obtener sugerencia proactiva de Gemini:", error);
+        // Devolvemos un mensaje genérico en caso de error para no romper la UI.
+        return `¡Que tengas un día excelente, ${user.name}! Recuerda tomar un momento para ti.`;
+    }
+};

@@ -1,7 +1,7 @@
-
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { Modal } from './Modal';
+import { isConfigured } from '../firebase/config';
 
 interface RegisterModalProps {
   isOpen: boolean;
@@ -20,6 +20,10 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({ isOpen, onClose, o
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isConfigured) {
+        setError('La integración con Firebase no está configurada.');
+        return;
+    }
     if (password !== confirmPassword) {
       setError('Las contraseñas no coinciden.');
       return;
@@ -87,8 +91,9 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({ isOpen, onClose, o
         </div>
         <button
           type="submit"
-          disabled={loading}
-          className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:bg-gray-400"
+          disabled={loading || !isConfigured}
+          title={!isConfigured ? 'La integración con Firebase no está configurada.' : ''}
+          className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:bg-gray-400 disabled:cursor-not-allowed"
         >
           {loading ? 'Creando...' : 'Crear Cuenta'}
         </button>

@@ -34,11 +34,18 @@ export interface Appointment {
   date: string; // ISO string
 }
 
+export interface VisualJournalEntry {
+  id: string;
+  date: string;
+  imageUrl: string; // Data URL
+  userText: string;
+  aiAnalysis: string;
+}
+
 export interface User {
-  id: number;
+  id: string; // Changed to string for Firebase UID
   name: string;
   email: string;
-  passwordHash?: string;
   avatar: string;
   preferences: string[];
   goals: string;
@@ -49,6 +56,7 @@ export interface User {
   feedback: { [key: number]: 'positive' | 'negative' };
   achievements: string[];
   appointments: Appointment[];
+  journal: VisualJournalEntry[];
   createdAt: string;
   membershipTier: 'free' | 'premium';
 }

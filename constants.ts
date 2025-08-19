@@ -141,7 +141,7 @@ const getFutureDate = (days: number) => {
 
 
 export const DEMO_USER: User = {
-    id: 999,
+    id: 'demo-user-999',
     name: 'Usuario Demo',
     email: 'demo@caliope.app',
     avatar: 'D',
@@ -176,6 +176,7 @@ export const DEMO_USER: User = {
             date: getFutureDate(12),
         }
     ],
+    journal: [],
     createdAt: new Date().toISOString(),
     membershipTier: 'premium'
 };

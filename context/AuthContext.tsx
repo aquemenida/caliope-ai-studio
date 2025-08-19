@@ -1,31 +1,34 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode, useCallback } from 'react';
-import { User, Recommendation, Achievement, Notification, NotificationType, Appointment } from '../types';
+import { User, Recommendation, Notification, NotificationType, Appointment, VisualJournalEntry } from '../types';
 import { ACHIEVEMENTS, DEMO_USER } from '../constants';
+import { auth, db, googleProvider } from '../firebase/config';
+import { 
+    onAuthStateChanged, 
+    setPersistence, 
+    inMemoryPersistence, 
+    User as FirebaseUser, 
+    createUserWithEmailAndPassword, 
+    signInWithEmailAndPassword, 
+    signInWithPopup, 
+    signOut 
+} from 'firebase/auth';
+import { 
+    doc, 
+    getDoc, 
+    setDoc, 
+    updateDoc, 
+    arrayUnion, 
+    collection, 
+    getDocs 
+} from 'firebase/firestore';
 
-// --- Helper Functions ---
-const hashPassword = (password: string): string => {
-  let hash = 0;
-  for (let i = 0; i < password.length; i++) {
-    const char = password.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return hash.toString();
-};
-
-const decodeJwt = (token: string) => {
-    try {
-      return JSON.parse(atob(token.split('.')[1]));
-    } catch (e) {
-      console.error("Error decoding JWT", e);
-      return null;
-    }
-  };
 
 interface AuthContextType {
   currentUser: User | null;
   isAuthenticated: boolean;
   isDemoMode: boolean;
+  loading: boolean;
+  users: User[]; // For admin panel
   login: (email: string, password: string) => Promise<void>;
   register: (name: string, email: string, password: string) => Promise<void>;
   logout: () => void;
@@ -33,59 +36,48 @@ interface AuthContextType {
   addFeedback: (serviceId: number, feedback: 'positive' | 'negative') => void;
   addHistory: (preferences: string, recommendations: Recommendation[]) => void;
   addAppointment: (serviceId: number, serviceName: string) => void;
+  addJournalEntry: (entryData: { imageUrl: string; userText: string; aiAnalysis: string; }) => void;
   notifications: Notification[];
   addNotification: (message: string, type: NotificationType) => void;
-  loginWithGoogle: (credential: string) => Promise<void>;
+  loginWithGoogle: () => Promise<void>;
   addExperiencePoints: (amount: number) => void;
   startDemoMode: () => void;
   upgradeToPremium: () => void;
+  fetchAllUsers: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const createNewUserDocument = async (firebaseUser: FirebaseUser, additionalData: { name: string, avatar: string }): Promise<User> => {
+    if (!db) throw new Error("La base de datos no está configurada.");
+    const newUser: User = {
+        id: firebaseUser.uid,
+        email: firebaseUser.email!,
+        name: additionalData.name,
+        avatar: additionalData.avatar,
+        preferences: [],
+        goals: '',
+        bio: '',
+        level: 1,
+        experience: 0,
+        history: [],
+        feedback: {},
+        achievements: [],
+        appointments: [],
+        journal: [],
+        createdAt: new Date().toISOString(),
+        membershipTier: 'free',
+    };
+    await setDoc(doc(db, 'users', firebaseUser.uid), newUser);
+    return newUser;
+};
+
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isDemoMode, setIsDemoMode] = useState(false);
-
-  useEffect(() => {
-    try {
-      const storedUsers = localStorage.getItem('caliopeUsers');
-      const storedCurrentUser = localStorage.getItem('caliopeCurrentUser');
-      if (storedUsers) {
-        setUsers(JSON.parse(storedUsers));
-      }
-      if (storedCurrentUser) {
-        setCurrentUser(JSON.parse(storedCurrentUser));
-      }
-    } catch (error) {
-      console.error("Failed to parse from localStorage", error);
-    }
-  }, []);
-
-  const saveUsers = useCallback((updatedUsers: User[]) => {
-    if (isDemoMode) return;
-    setUsers(updatedUsers);
-    localStorage.setItem('caliopeUsers', JSON.stringify(updatedUsers));
-  }, [isDemoMode]);
-
-  const saveCurrentUser = useCallback((user: User | null) => {
-    setCurrentUser(user);
-    if (isDemoMode) return;
-
-    if (user) {
-        localStorage.setItem('caliopeCurrentUser', JSON.stringify(user));
-        const updatedUsers = users.map(u => u.id === user.id ? user : u);
-        // Ensure the user exists in the list before saving
-        if (!updatedUsers.find(u => u.id === user.id)) {
-            updatedUsers.push(user);
-        }
-        saveUsers(updatedUsers);
-    } else {
-        localStorage.removeItem('caliopeCurrentUser');
-    }
-  }, [users, saveUsers, isDemoMode]);
+  const [users, setUsers] = useState<User[]>([]); // For admin
 
   const addNotification = useCallback((message: string, type: NotificationType) => {
     const newNotification: Notification = { id: Date.now(), message, type };
@@ -95,160 +87,202 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }, 5000);
   }, []);
 
-  const addExperience = useCallback((user: User, amount: number): User => {
+  useEffect(() => {
+    if (!auth || !db) {
+        setLoading(false);
+        return;
+    }
+
+    let unsubscribe: () => void;
+
+    // Set in-memory persistence to avoid issues in environments with restricted storage.
+    setPersistence(auth, inMemoryPersistence)
+      .then(() => {
+        // Now that persistence is set, attach the auth state change listener.
+        unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user && !isDemoMode) {
+                const userRef = doc(db, 'users', user.uid);
+                const userSnap = await getDoc(userRef);
+                if (userSnap.exists()) {
+                    setCurrentUser(userSnap.data() as User);
+                } else {
+                    const newUser = await createNewUserDocument(user, { name: user.displayName || user.email || 'Nuevo Usuario', avatar: user.photoURL || (user.displayName || 'U').charAt(0).toUpperCase() });
+                    setCurrentUser(newUser);
+                }
+            } else {
+                setCurrentUser(null);
+            }
+            setLoading(false);
+        });
+      })
+      .catch((error) => {
+        console.error("Error setting auth persistence:", error);
+        addNotification("No se pudo inicializar la sesión. La autenticación podría no funcionar correctamente.", 'error');
+        setLoading(false);
+      });
+
+    // Return the cleanup function
+    return () => {
+        if (unsubscribe) {
+            unsubscribe();
+        }
+    };
+  }, [isDemoMode, addNotification]);
+
+
+  const addExperience = useCallback(async (user: User, amount: number): Promise<void> => {
+    if (isDemoMode) {
+        const newExperience = user.experience + amount;
+        const newLevel = Math.floor(newExperience / 100) + 1;
+        setCurrentUser(prev => prev ? {...prev, experience: newExperience, level: newLevel} : null);
+        return;
+    };
+    
+    if (!db) return; // Salir si la base de datos no está configurada
+
+    const userRef = doc(db, 'users', user.id);
     const newExperience = user.experience + amount;
     const newLevel = Math.floor(newExperience / 100) + 1;
     let newAchievements = [...user.achievements];
 
-    if (newLevel > user.level) {
-        if(newLevel >= 5 && !user.achievements.includes('level-5')) {
-            newAchievements.push('level-5');
-            addNotification(`¡Nuevo Logro: ${ACHIEVEMENTS['level-5'].name}!`, 'info');
-        }
+    if (newLevel > user.level && newLevel >= 5 && !user.achievements.includes('level-5')) {
+        newAchievements.push('level-5');
+        addNotification(`¡Nuevo Logro: ${ACHIEVEMENTS['level-5'].name}!`, 'info');
     }
-
-    if (Object.keys(user.feedback).length >= 5 && !user.achievements.includes('feedback-master')) {
+    if (Object.keys(user.feedback).length >= 4 && !user.achievements.includes('feedback-master')) {
         newAchievements.push('feedback-master');
         addNotification(`¡Nuevo Logro: ${ACHIEVEMENTS['feedback-master'].name}!`, 'info');
     }
-
-    if (user.history.length >= 1 && !user.achievements.includes('first-use')) {
+    if (user.history.length >= 0 && !user.achievements.includes('first-use')) {
         newAchievements.push('first-use');
         addNotification(`¡Nuevo Logro: ${ACHIEVEMENTS['first-use'].name}!`, 'info');
     }
+    
+    await updateDoc(userRef, {
+        experience: newExperience,
+        level: newLevel,
+        achievements: newAchievements
+    });
+    setCurrentUser(prev => prev ? { ...prev, experience: newExperience, level: newLevel, achievements: newAchievements } : null);
 
-    return { ...user, experience: newExperience, level: newLevel, achievements: newAchievements };
-  }, [addNotification]);
+  }, [addNotification, isDemoMode]);
   
   const addExperiencePoints = (amount: number) => {
     if (!currentUser) return;
-    const userWithExp = addExperience(currentUser, amount);
-    saveCurrentUser(userWithExp);
+    addExperience(currentUser, amount);
     addNotification(`+${amount} EXP añadido.`, 'info');
   };
 
 
   const register = async (name: string, email: string, password: string): Promise<void> => {
-    if (users.find(user => user.email === email)) {
-      throw new Error('El correo electrónico ya está registrado.');
+    if (!auth || !db) {
+        addNotification('El servicio de autenticación no está disponible.', 'error');
+        throw new Error('Firebase no configurado');
     }
-    const newUser: User = {
-      id: Date.now(),
-      name,
-      email,
-      passwordHash: hashPassword(password),
-      avatar: name.charAt(0).toUpperCase(),
-      preferences: [],
-      goals: '',
-      bio: '',
-      level: 1,
-      experience: 0,
-      history: [],
-      feedback: {},
-      achievements: [],
-      appointments: [],
-      createdAt: new Date().toISOString(),
-      membershipTier: 'free',
-    };
-    saveUsers([...users, newUser]);
+    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+    const { user } = userCredential;
+    if (!user) throw new Error("No se pudo crear el usuario.");
+    await createNewUserDocument(user, { name, avatar: name.charAt(0).toUpperCase() });
   };
 
   const login = async (email: string, password: string): Promise<void> => {
-    const user = users.find(u => u.email === email);
-    if (!user || !user.passwordHash || user.passwordHash !== hashPassword(password)) {
-      throw new Error('Correo electrónico o contraseña incorrectos.');
+    if (!auth) {
+        addNotification('El servicio de autenticación no está disponible.', 'error');
+        throw new Error('Firebase no configurado');
     }
-    saveCurrentUser(user);
+    await signInWithEmailAndPassword(auth, email, password);
   };
   
-  const loginWithGoogle = async (credential: string): Promise<void> => {
-    const payload = decodeJwt(credential);
-    if (!payload) {
-        throw new Error('Credencial de Google inválida.');
+  const loginWithGoogle = async (): Promise<void> => {
+    if (!auth || !googleProvider || !db) {
+        addNotification('El inicio de sesión con Google no está disponible.', 'error');
+        throw new Error('Firebase no configurado');
     }
-    const { email, name, picture } = payload;
-    const existingUser = users.find(u => u.email === email);
+    const result = await signInWithPopup(auth, googleProvider);
+    const user = result.user;
+    if (!user) throw new Error("Inicio de sesión con Google fallido.");
+    const userRef = doc(db, 'users', user.uid);
+    const userSnap = await getDoc(userRef);
 
-    if(existingUser) {
-        const updatedUser = { ...existingUser, name, avatar: picture || name.charAt(0).toUpperCase() };
-        saveCurrentUser(updatedUser);
-    } else {
-        const newUser: User = {
-            id: Date.now(),
-            name,
-            email,
-            avatar: picture || name.charAt(0).toUpperCase(),
-            preferences: [],
-            goals: '',
-            bio: '',
-            level: 1,
-            experience: 0,
-            history: [],
-            feedback: {},
-            achievements: [],
-            appointments: [],
-            createdAt: new Date().toISOString(),
-            membershipTier: 'free',
-        };
-        const updatedUsers = [...users, newUser];
-        saveUsers(updatedUsers);
-        saveCurrentUser(newUser);
+    if (!userSnap.exists()) {
+        await createNewUserDocument(user, { name: user.displayName || user.email!, avatar: user.photoURL || user.displayName?.charAt(0) || 'G' });
     }
   };
 
   const startDemoMode = () => {
+    if (auth) signOut(auth);
     const demoUserCopy = JSON.parse(JSON.stringify(DEMO_USER));
     setCurrentUser(demoUserCopy);
     setIsDemoMode(true);
+    setLoading(false);
     addNotification('Has entrado en el modo de demostración.', 'info');
   };
 
-  const logout = () => {
-    saveCurrentUser(null);
-    setIsDemoMode(false);
+  const logout = async () => {
+    if(isDemoMode){
+        setIsDemoMode(false);
+        setCurrentUser(null);
+    } else if (auth) {
+        await signOut(auth);
+    }
   };
   
   const updateProfile = async (updates: Partial<User>): Promise<void> => {
     if (!currentUser) throw new Error("No hay usuario autenticado.");
-    if(!isDemoMode && updates.email && updates.email !== currentUser.email && users.find(u => u.email === updates.email)){
-        throw new Error("El correo electrónico ya está en uso.");
+    if (isDemoMode) {
+        setCurrentUser(prev => prev ? { ...prev, ...updates } : null);
+        return;
     }
-
-    const updatedUser = { ...currentUser, ...updates, avatar: (updates.name || currentUser.name).charAt(0).toUpperCase() };
-    saveCurrentUser(updatedUser);
+    
+    if (!db) {
+        addNotification('No se pudo actualizar el perfil. La base de datos no está disponible.', 'error');
+        return;
+    }
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, updates);
+    setCurrentUser(prev => prev ? { ...prev, ...updates } : null);
   };
 
-  const addFeedback = (serviceId: number, feedback: 'positive' | 'negative') => {
+  const addFeedback = async (serviceId: number, feedback: 'positive' | 'negative') => {
     if (!currentUser) return;
-    const updatedUser = {
-        ...currentUser,
-        feedback: {
-            ...currentUser.feedback,
-            [serviceId]: feedback,
-        }
-    };
-    const userWithExp = addExperience(updatedUser, 5);
-    saveCurrentUser(userWithExp);
+    await addExperience(currentUser, 5);
+
+    if (isDemoMode) {
+        setCurrentUser(prev => prev ? {...prev, feedback: {...prev.feedback, [serviceId]: feedback}} : null);
+        addNotification('¡Gracias por tu retroalimentación!', 'success');
+        return;
+    }
+    
+    if (!db) {
+        addNotification('No se pudo guardar la retroalimentación.', 'error');
+        return;
+    }
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, {
+        [`feedback.${serviceId}`]: feedback,
+    });
     addNotification('¡Gracias por tu retroalimentación!', 'success');
   };
 
-  const addHistory = (preferences: string, recommendations: Recommendation[]) => {
-    if (!currentUser) return;
+  const addHistory = async (preferences: string, recommendations: Recommendation[]) => {
+    if (!currentUser || !db) return;
+    await addExperience(currentUser, 10);
     const historyItem = { date: new Date().toISOString(), preferences, recommendations };
-    const updatedHistory = [historyItem, ...currentUser.history];
     
-    const updatedUser = {
-        ...currentUser,
-        history: updatedHistory,
-    };
-    const userWithExp = addExperience(updatedUser, 10);
-    saveCurrentUser(userWithExp);
+    if (isDemoMode) {
+        setCurrentUser(prev => prev ? {...prev, history: [historyItem, ...prev.history]} : null);
+        return;
+    }
+    
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, {
+        history: arrayUnion(historyItem)
+    });
   };
 
-  const addAppointment = (serviceId: number, serviceName: string) => {
-    if (!currentUser) return;
+  const addAppointment = async (serviceId: number, serviceName: string) => {
+    if (!currentUser || !db) return;
 
-    // Schedule for 1 week from now at a random time between 9am and 5pm
     const appointmentDate = new Date();
     appointmentDate.setDate(appointmentDate.getDate() + 7);
     appointmentDate.setHours(Math.floor(Math.random() * 8) + 9, Math.random() > 0.5 ? 30 : 0, 0, 0);
@@ -258,26 +292,77 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         serviceName,
         date: appointmentDate.toISOString(),
     };
-
-    const updatedUser: User = {
-        ...currentUser,
-        appointments: [...(currentUser.appointments || []), newAppointment].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
-    };
     
-    saveCurrentUser(updatedUser);
+    if (isDemoMode) {
+        setCurrentUser(prev => prev ? {...prev, appointments: [...prev.appointments, newAppointment]} : null);
+        addNotification(`Cita para "${serviceName}" reservada con éxito.`, 'success');
+        return;
+    }
+
+    if (!db) {
+        addNotification('No se pudo agendar la cita.', 'error');
+        return;
+    }
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, {
+        appointments: arrayUnion(newAppointment)
+    });
     addNotification(`Cita para "${serviceName}" reservada con éxito.`, 'success');
   };
   
-  const upgradeToPremium = () => {
+  const upgradeToPremium = async () => {
     if (!currentUser) return;
-    const updatedUser = { ...currentUser, membershipTier: 'premium' as const };
-    saveCurrentUser(updatedUser);
+     if (isDemoMode) {
+        setCurrentUser(prev => prev ? { ...prev, membershipTier: 'premium' } : null);
+        addNotification('¡Felicidades! Has actualizado a Caliope Premium.', 'success');
+        return;
+    }
+    if (!db) {
+        addNotification('No se pudo actualizar la membresía.', 'error');
+        return;
+    }
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, { membershipTier: 'premium' });
     addNotification('¡Felicidades! Has actualizado a Caliope Premium.', 'success');
+  };
+  
+  const addJournalEntry = async (entryData: { imageUrl: string; userText: string; aiAnalysis: string; }) => {
+    if (!currentUser || !db) return;
+    await addExperience(currentUser, 15);
+    const newEntry: VisualJournalEntry = {
+        id: `journal_${Date.now()}`,
+        date: new Date().toISOString(),
+        ...entryData
+    };
+    
+    if (isDemoMode) {
+        setCurrentUser(prev => prev ? {...prev, journal: [newEntry, ...prev.journal]} : null);
+        addNotification('Tu diario ha sido actualizado.', 'success');
+        return;
+    }
+
+    if (!db) {
+        addNotification('No se pudo guardar la entrada del diario.', 'error');
+        return;
+    }
+    const userRef = doc(db, 'users', currentUser.id);
+    await updateDoc(userRef, {
+        journal: arrayUnion(newEntry)
+    });
+    addNotification('Tu diario ha sido actualizado.', 'success');
+  };
+
+  const fetchAllUsers = async () => {
+    if (currentUser?.email !== 'admin@caliope.app' || !db) return;
+    const usersCollection = collection(db, "users");
+    const querySnapshot = await getDocs(usersCollection);
+    const usersList = querySnapshot.docs.map(doc => doc.data() as User);
+    setUsers(usersList);
   };
 
 
   return (
-    <AuthContext.Provider value={{ currentUser, isAuthenticated: !!currentUser, isDemoMode, login, register, logout, updateProfile, addFeedback, addHistory, notifications, addNotification, loginWithGoogle, addAppointment, addExperiencePoints, startDemoMode, upgradeToPremium }}>
+    <AuthContext.Provider value={{ currentUser, isAuthenticated: !!currentUser, isDemoMode, loading, users, login, register, logout, updateProfile, addFeedback, addHistory, addJournalEntry, notifications, addNotification, loginWithGoogle, addAppointment, addExperiencePoints, startDemoMode, upgradeToPremium, fetchAllUsers }}>
       {children}
     </AuthContext.Provider>
   );
